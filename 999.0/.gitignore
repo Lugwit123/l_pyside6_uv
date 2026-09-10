@@ -1,0 +1,21 @@
+# uv / python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Qt Designer / compiler outputs
+ui_*.py
+resources_*_rc.py
+
+# Launcher favorites
+.uv_launcher_favorites.json
+.uv_launcher_custom.json
+.uv_launcher_settings.json
+requirements.txt
+
+# IDE
+.idea/
+.vscode/
