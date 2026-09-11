@@ -22,11 +22,20 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QProcess, QProcessEnvironment, Qt
-from PySide6.QtGui import QBrush, QColor, QFont
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QFont,
+    QStandardItem,
+    QStandardItemModel,
+)
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
+    QCompleter,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QInputDialog,
@@ -49,6 +58,10 @@ VENV_DIR = PROJECT_ROOT / ".venv"
 FAV_FILE = PROJECT_ROOT / ".uv_launcher_favorites.json"
 CUSTOM_FILE = PROJECT_ROOT / ".uv_launcher_custom.json"
 SIZE_FILE = PROJECT_ROOT / ".uv_launcher_settings.json"
+HISTORY_FILE = PROJECT_ROOT / ".uv_launcher_history.json"
+MAX_HISTORY = 100
+DEFAULT_SEARCH_DIR = r"D:\TD_Depot\Software\Python\uv_venv"
+COMMON_LIBS = ["pip", "PySide6", "numpy", "pandas", "matplotlib", "requests", "scipy", "scikit-learn", "pillow", "openpyxl", "tqdm"]
 
 DARK_QSS = """
 QWidget { background-color: #1e1e1e; color: #d4d4d4; }
@@ -66,6 +79,11 @@ QPlainTextEdit { background-color: #1e1e1e; border: 1px solid #3c3c3c; color: #c
 QDialog { background-color: #252526; }
 QLabel { background-color: transparent; }
 QToolTip { background-color: #2d2d2d; color: #d4d4d4; border: 1px solid #3c3c3c; }
+QMenu { background-color: #2d2d2d; border: 1px solid #3c3c3c; }
+QMenu::item { padding: 6px 24px 6px 10px; background: transparent; }
+QMenu::item:selected { background-color: #094771; color: #ffffff; }
+QMenu::item:disabled { color: #6b6b6b; }
+QMenu::separator { height: 1px; background: #3c3c3c; margin: 4px 8px; }
 """
 
 BUILTIN = [
@@ -210,7 +228,7 @@ def _classify(path, project):
     return "系统"
 
 
-def discover_interpreters():
+def discover_interpreters(custom_paths=(), search_dir=None):
     """返回 [(显示文本, python.exe 路径, 来源, uv名称), ...]，按 项目 / uv 安装 / 系统 分组排序。"""
     proj, uv_list, sys_list = [], [], []
     seen = set()
@@ -218,6 +236,22 @@ def discover_interpreters():
         p = str(py)
         proj.append((f"{py.parent.parent.name}   {p}", p, "项目", ""))
         seen.add(p)
+
+    def add_one(path):
+        path = str(path)
+        if path in seen or not Path(path).exists():
+            return
+        seen.add(path)
+        p = Path(path)
+        project_root = p.parent.parent.parent  # <项目>/.venv/Scripts/python.exe
+        if (project_root / "pyproject.toml").exists():
+            proj.append((f"{project_root.name}   {path}", path, "项目", ""))
+            return
+        if _classify(path, False) == "系统":
+            sys_list.append((f"{p.parent.parent.name}   {path}", path, "系统", ""))
+        else:
+            uv_list.append((f"{p.parent.parent.name}   {path}", path, "uv 安装", ""))
+
     try:
         res = subprocess.run(
             ["uv", "python", "list"], capture_output=True, text=True, timeout=20
@@ -238,6 +272,14 @@ def discover_interpreters():
                 uv_list.append((f"{name}   {path}", path, "uv 安装", name))
     except Exception:
         pass
+
+    for p in custom_paths:
+        add_one(p)
+    if search_dir:
+        base = Path(search_dir)
+        if base.is_dir():
+            for py in sorted(base.rglob("Scripts/python.exe")):
+                add_one(py)
     return proj + uv_list + sys_list
 
 
@@ -252,17 +294,113 @@ def default_interpreter(settings):
     return None
 
 
+class SettingsDialog(QDialog):
+    def __init__(self, parent, search_dir):
+        super().__init__(parent)
+        self.setWindowTitle("设置")
+        self.resize(540, 160)
+        self.search_dir = search_dir
+        form = QFormLayout(self)
+        dir_row = QWidget()
+        hl = QHBoxLayout(dir_row)
+        hl.setContentsMargins(0, 0, 0, 0)
+        self.dir_edit = QLineEdit(search_dir)
+        browse = QPushButton("浏览…")
+        browse.clicked.connect(self._browse)
+        hl.addWidget(self.dir_edit, 1)
+        hl.addWidget(browse)
+        form.addRow("搜索解释器路径:", dir_row)
+        tip = QLabel("该目录（含所有子目录）下的 Scripts\\python.exe 都会被识别为解释器。")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color: #999;")
+        form.addRow(tip)
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self._ok)
+        btns.rejected.connect(self.reject)
+        form.addRow(btns)
+
+    def _browse(self):
+        start = self.dir_edit.text().strip() or str(Path.home())
+        d = QFileDialog.getExistingDirectory(self, "选择搜索目录", start)
+        if d:
+            self.dir_edit.setText(d)
+
+    def _ok(self):
+        self.search_dir = self.dir_edit.text().strip()
+        self.accept()
+
+
+class NewVenvDialog(QDialog):
+    """用指定 uv 解释器新建一个项目(+venv) 或仅一个 venv。"""
+
+    def __init__(self, parent, interpreter, make_project):
+        super().__init__(parent)
+        self.setWindowTitle("新建项目 + 虚拟环境" if make_project else "新建虚拟环境")
+        self.resize(540, 180)
+        self.target = ""
+        form = QFormLayout(self)
+        dir_row = QWidget()
+        hl = QHBoxLayout(dir_row)
+        hl.setContentsMargins(0, 0, 0, 0)
+        self.dir_edit = QLineEdit(str(Path.home()))
+        browse = QPushButton("浏览…")
+        browse.clicked.connect(self._browse)
+        hl.addWidget(self.dir_edit, 1)
+        hl.addWidget(browse)
+        self.name_edit = QLineEdit()
+        form.addRow("父目录:", dir_row)
+        form.addRow("新文件夹名:", self.name_edit)
+        tip = QLabel(f"解释器: {interpreter}")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color: #999;")
+        form.addRow(tip)
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self._ok)
+        btns.rejected.connect(self.reject)
+        form.addRow(btns)
+
+    def _browse(self):
+        start = self.dir_edit.text().strip() or str(Path.home())
+        d = QFileDialog.getExistingDirectory(self, "选择父目录", start)
+        if d:
+            self.dir_edit.setText(d)
+
+    def _ok(self):
+        parent = self.dir_edit.text().strip()
+        name = self.name_edit.text().strip()
+        if not parent or not name:
+            QMessageBox.warning(self, "新建", "父目录和文件夹名都不能为空。")
+            return
+        self.target = str(Path(parent) / name)
+        self.accept()
+
+
 class InterpreterDialog(QDialog):
-    def __init__(self, parent, entries, current):
+    def __init__(self, parent, entries, current, custom=None, search_dir=None):
         super().__init__(parent)
         self.setWindowTitle("选择 Python 解释器")
         self.resize(600, 400)
         self.selected = current
         self.entries = entries
+        self.custom = list(custom or [])
+        self.search_dir = search_dir
         layout = QVBoxLayout(self)
+        head = QHBoxLayout()
         tip = QLabel("选择默认激活的解释器，手动输入框将用它执行命令（也可选「uv 自动选择」）。")
         tip.setWordWrap(True)
-        layout.addWidget(tip)
+        refresh = QPushButton("刷新")
+        refresh.clicked.connect(self._refresh)
+        add = QPushButton("添加解释器…")
+        add.clicked.connect(self._add_custom)
+        head.addWidget(tip, 1)
+        head.addWidget(add)
+        head.addWidget(refresh)
+        layout.addLayout(head)
+
         self.list = QListWidget()
         self.list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -284,12 +422,6 @@ class InterpreterDialog(QDialog):
         btns.accepted.connect(self._accept)
         btns.rejected.connect(self.reject)
         layout.addWidget(btns)
-
-    def _accept(self):
-        item = self.list.currentItem()
-        if item is not None:
-            self.selected = item.data(Qt.ItemDataRole.UserRole)
-        self.accept()
 
     def _insert_entries(self):
         GROUP_LABELS = {"项目": "项目解释器", "uv 安装": "uv 安装", "系统": "系统安装"}
@@ -318,6 +450,31 @@ class InterpreterDialog(QDialog):
             item.setData(Qt.ItemDataRole.UserRole + 2, uvname)
             self.list.addItem(item)
 
+    def _accept(self):
+        item = self.list.currentItem()
+        if item is not None:
+            self.selected = item.data(Qt.ItemDataRole.UserRole)
+        self.accept()
+
+    def _refresh(self):
+        self.entries = discover_interpreters(self.custom, self.search_dir)
+        self._rebuild()
+
+    def _add_custom(self):
+        start = str(Path.home())
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, "选择 python.exe", start, "Python 解释器 (python.exe);;所有文件 (*)"
+        )
+        if not chosen:
+            return
+        chosen = os.path.normpath(chosen)
+        if chosen in self.custom:
+            QMessageBox.information(self, "添加解释器", "该解释器已在列表中。")
+            return
+        self.custom.append(chosen)
+        self.entries = discover_interpreters(self.custom, self.search_dir)
+        self._rebuild()
+
     def _rebuild(self):
         current = self.selected
         self.list.blockSignals(True)
@@ -341,17 +498,51 @@ class InterpreterDialog(QDialog):
         if not src:
             return
         uvname = item.data(Qt.ItemDataRole.UserRole + 2)
+        path = item.data(Qt.ItemDataRole.UserRole)
+        in_custom = bool(path) and path in self.custom
         menu = QMenu(self)
+        act_copy = menu.addAction("复制解释器/工程路径")
+        menu.addSeparator()
         if uvname:
-            act = menu.addAction("卸载此解释器")
+            act_uninstall = menu.addAction("卸载此解释器")
+            menu.addSeparator()
+            act_newproj = menu.addAction("用此解释器新建项目(含 venv)")
+            act_newvenv = menu.addAction("用此解释器仅新建 venv")
+        elif in_custom:
+            act_remove = menu.addAction("从列表移除")
         else:
             act = menu.addAction("无法卸载")
             act.setEnabled(False)
-            menu.exec(self.list.viewport().mapToGlobal(pos))
-            return
         chosen = menu.exec(self.list.viewport().mapToGlobal(pos))
-        if chosen == act:
+        if chosen == act_copy:
+            self._copy_path(item)
+        elif uvname and chosen == act_uninstall:
             self._uninstall(idx.row(), item, src, uvname)
+        elif uvname and chosen == act_newproj:
+            self._new_from_interpreter(item, True)
+        elif uvname and chosen == act_newvenv:
+            self._new_from_interpreter(item, False)
+        elif in_custom and chosen == act_remove:
+            self._remove_custom(idx.row())
+
+    def _copy_path(self, item):
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if not path:
+            return
+        QApplication.clipboard().setText(path)
+        proj_root = Path(path).parent.parent.parent
+        msg = f"已复制解释器路径:\n{path}"
+        if (proj_root / "pyproject.toml").exists():
+            msg += f"\n所属项目:\n{proj_root}"
+        QMessageBox.information(self, "复制路径", msg)
+
+    def _remove_custom(self, row):
+        item = self.list.item(row)
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if path in self.custom:
+            self.custom.remove(path)
+        self.entries = discover_interpreters(self.custom, self.search_dir)
+        self._rebuild()
 
     def _uninstall(self, row, item, src, uvname):
         answer = QMessageBox.question(
@@ -368,12 +559,54 @@ class InterpreterDialog(QDialog):
             out = (res.stdout or "").strip() or (res.stderr or "").strip()
             if res.returncode == 0:
                 QMessageBox.information(self, "卸载解释器", f"卸载成功。\n{out}")
-                self.entries = discover_interpreters()
+                self.entries = discover_interpreters(self.custom, self.search_dir)
                 self._rebuild()
             else:
                 QMessageBox.warning(self, "卸载解释器", f"卸载失败：\n{out or res.returncode}")
         except Exception as exc:
             QMessageBox.warning(self, "卸载解释器", f"卸载出错：{exc}")
+
+    def _new_from_interpreter(self, item, make_project):
+        interp = item.data(Qt.ItemDataRole.UserRole)
+        dlg = NewVenvDialog(self, interp, make_project)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        target = dlg.target
+        try:
+            if make_project:
+                res = subprocess.run(
+                    ["uv", "init", target, "--python", interp],
+                    capture_output=True, text=True, timeout=180,
+                )
+                if res.returncode != 0:
+                    out = (res.stdout or "").strip() or (res.stderr or "").strip()
+                    QMessageBox.warning(self, "新建", f"项目初始化失败：\n{out or res.returncode}")
+                    return
+                sync = subprocess.run(
+                    ["uv", "sync"], cwd=target,
+                    capture_output=True, text=True, timeout=600,
+                )
+                out = (res.stdout or "").strip()
+                sync_out = (sync.stdout or "").strip() or (sync.stderr or "").strip()
+                if sync.returncode != 0:
+                    QMessageBox.warning(self, "新建", f"项目已建，但依赖同步失败：\n{sync_out or sync.returncode}")
+                    return
+                QMessageBox.information(
+                    self, "新建",
+                    f"项目 + 虚拟环境创建成功：\n{target}\n\n{out}\n{sync_out}",
+                )
+            else:
+                res = subprocess.run(
+                    ["uv", "venv", target, "--python", interp],
+                    capture_output=True, text=True, timeout=180,
+                )
+                out = (res.stdout or "").strip() or (res.stderr or "").strip()
+                if res.returncode == 0:
+                    QMessageBox.information(self, "新建", f"虚拟环境创建成功：\n{target}\n\n{out}")
+                else:
+                    QMessageBox.warning(self, "新建", f"创建失败：\n{out or res.returncode}")
+        except Exception as exc:
+            QMessageBox.warning(self, "新建", f"创建出错：{exc}")
 
 
 class CommandEditDialog(QDialog):
@@ -509,6 +742,10 @@ class LauncherWindow(QMainWindow):
         height = int(self.settings.get("height", 600))
         self.resize(width, height)
         self.interpreter = default_interpreter(self.settings)
+        self.custom_interpreters = [
+            p for p in self.settings.get("custom_interpreters", []) if Path(p).exists()
+        ]
+        self.search_dir = self.settings.get("search_dir") or DEFAULT_SEARCH_DIR
 
         self.favorites = set(load_json(FAV_FILE, {}).get("favorites", []))
         self.custom = load_json(CUSTOM_FILE, [])
@@ -534,8 +771,20 @@ class LauncherWindow(QMainWindow):
         top = QHBoxLayout()
         self.interp_btn = QPushButton("选择解释器")
         self.interp_btn.clicked.connect(self.choose_interpreter)
-        self.manual_input = QLineEdit()
-        self.manual_input.returnPressed.connect(self.run_manual)
+        self.history = load_json(HISTORY_FILE, [])[:MAX_HISTORY]
+        self.manual_input = QComboBox()
+        self.manual_input.setEditable(True)
+        self.manual_input.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.manual_input.addItems(self.history)
+        self.history_model = QStandardItemModel(self)
+        for h in self.history:
+            self.history_model.appendRow(QStandardItem(h))
+        self.completer = QCompleter(self.history_model, self)
+        self.completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self.manual_input.setCompleter(self.completer)
+        self.manual_input.lineEdit().returnPressed.connect(self.run_manual)
         self.manual_btn = QPushButton("运行")
         self.manual_btn.clicked.connect(self.run_manual)
         self.search = QLineEdit()
@@ -579,10 +828,17 @@ class LauncherWindow(QMainWindow):
         self.new_btn.clicked.connect(self.add_command)
         self.edit_btn = QPushButton("编辑/删除")
         self.edit_btn.clicked.connect(self.edit_command)
+        self.settings_btn = QPushButton("设置")
+        self.settings_btn.clicked.connect(self.open_settings)
+        self.term_btn = QPushButton("打开命令行")
+        self.term_btn.clicked.connect(self.open_terminal)
+        self.libs_btn = QPushButton("一键安装常用库")
+        self.libs_btn.clicked.connect(self.install_common_libs)
         self.restart_btn = QPushButton("重启程序")
         self.restart_btn.clicked.connect(self.restart)
         for b in (self.run_btn, self.fav_btn, self.stop_btn,
-                  self.new_btn, self.edit_btn, self.restart_btn):
+                  self.new_btn, self.edit_btn, self.settings_btn,
+                  self.term_btn, self.libs_btn, self.restart_btn):
             btn_col.addWidget(b)
         btn_col.addStretch(1)
         mid.addLayout(btn_col)
@@ -614,26 +870,48 @@ class LauncherWindow(QMainWindow):
 
         self.rebuild_list()
 
-    # --- 解释器选择 ---
+    # --- 解释器选择 / 设置 ---
     def _interp_display(self):
         if not self.interpreter:
             return "uv 自动选择"
         return self.interpreter
 
+    def _venv_dir(self):
+        """返回当前解释器对应的 venv 目录；独立解释器返回 None；未选时返回项目默认 .venv。"""
+        if not self.interpreter:
+            return str(VENV_DIR)
+        venv = Path(self.interpreter).parent.parent
+        if (venv / "pyvenv.cfg").exists():
+            return str(venv)
+        return None
+
+    def _interpreter_env(self):
+        """让 uv 命令作用于当前解释器对应的环境。"""
+        if not self.interpreter:
+            return {}
+        venv = Path(self.interpreter).parent.parent
+        if (venv / "pyvenv.cfg").exists():
+            return {"UV_PROJECT_ENVIRONMENT": str(venv)}
+        return {"UV_PYTHON": self.interpreter}
+
     def _refresh_header(self):
-        self.header.setText(
-            f"项目根目录: {PROJECT_ROOT}<br>"
-            f"虚拟环境: {VENV_DIR}<br>"
-            f"当前解释器: {self._interp_display()}"
-        )
+        lines = [
+            f"项目根目录: {PROJECT_ROOT}",
+            f"当前解释器: {self._interp_display()}",
+        ]
+        venv = self._venv_dir()
+        if venv:
+            label = venv if self.interpreter else f"{venv}（项目默认）"
+            lines.append(f"当前虚拟环境: {label}")
+        self.header.setText("<br>".join(lines))
 
     def _refresh_manual_placeholder(self):
         if self.interpreter:
-            self.manual_input.setPlaceholderText(
-                "输入参数(用所选解释器执行)，如 -c print(1) / script.py / -m pip list，回车或点「运行」"
+            self.manual_input.lineEdit().setPlaceholderText(
+                "输入命令/脚本，如 script.py / -c print(1) / -m pip list，回车或点「运行」"
             )
         else:
-            self.manual_input.setPlaceholderText(
+            self.manual_input.lineEdit().setPlaceholderText(
                 "手动输入命令 (uv 后的参数，如 sync / add requests)，回车或点「运行」"
             )
 
@@ -642,17 +920,22 @@ class LauncherWindow(QMainWindow):
             "width": self.width(),
             "height": self.height(),
             "interpreter": self.interpreter or "",
+            "search_dir": self.search_dir,
+            "custom_interpreters": self.custom_interpreters,
         })
 
     def choose_interpreter(self):
-        entries = discover_interpreters()
+        entries = discover_interpreters(self.custom_interpreters, self.search_dir)
         if not entries:
             self.output.appendPlainText("未找到已安装的 Python 解释器（可先在列表中运行 uv python install）。")
             return
-        dlg = InterpreterDialog(self, entries, self.interpreter)
+        dlg = InterpreterDialog(self, entries, self.interpreter,
+                                self.custom_interpreters, self.search_dir)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         self.interpreter = dlg.selected or None
+        if dlg.custom != self.custom_interpreters:
+            self.custom_interpreters = list(dlg.custom)
         self._save_settings()
         self._refresh_header()
         self._refresh_manual_placeholder()
@@ -660,6 +943,60 @@ class LauncherWindow(QMainWindow):
             self.output.appendPlainText(f"已选择默认解释器: {self.interpreter}")
         else:
             self.output.appendPlainText("已恢复为 uv 自动选择解释器。")
+
+    def open_settings(self):
+        dlg = SettingsDialog(self, self.search_dir)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.search_dir = dlg.search_dir
+        self._save_settings()
+        self.output.appendPlainText(f"已更新搜索解释器路径: {self.search_dir}")
+
+    def open_terminal(self):
+        flags = subprocess.CREATE_NEW_CONSOLE
+        if self.interpreter:
+            interp = Path(self.interpreter)
+            venv = interp.parent.parent
+            activate = venv / "Scripts" / "activate.bat"
+        else:
+            venv = activate = None
+        if activate and activate.exists():
+            cwd = str(venv.parent)
+            subprocess.Popen(f'cmd /K call "{activate}"', cwd=cwd, creationflags=flags)
+            msg = f"激活环境: {activate}"
+        else:
+            cwd = str(PROJECT_ROOT)
+            subprocess.Popen("cmd /K", cwd=cwd, creationflags=flags)
+            msg = "已打开普通命令行"
+        self.output.appendPlainText(f"已打开命令行（目录: {cwd}）：{msg}")
+
+    def install_common_libs(self):
+        if not self.interpreter:
+            QMessageBox.warning(self, "安装常用库", "请先在「选择解释器」里选一个解释器。")
+            return
+        if self.proc.state() != QProcess.ProcessState.NotRunning:
+            self.output.appendPlainText("另一个命令正在运行，请稍候（或点「停止」）。")
+            return
+        interp = Path(self.interpreter)
+        venv = interp.parent.parent
+        if (venv / "pyvenv.cfg").exists():
+            target = str(venv)
+        else:
+            target = self.interpreter
+        answer = QMessageBox.question(
+            self, "安装常用库",
+            f"将往以下解释器安装常用库：\n{self.interpreter}\n\n"
+            f"安装位置: {target}\n\n"
+            f"库列表: {', '.join(COMMON_LIBS)}\n\n是否继续？",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._start(
+            "uv",
+            ["pip", "install", "--python", self.interpreter] + COMMON_LIBS,
+            "一键安装常用库",
+            None,
+        )
 
     # --- 列表构建 / 过滤 / 收藏 ---
     def _on_search(self, text):
@@ -820,10 +1157,12 @@ class LauncherWindow(QMainWindow):
         args = self.resolve_params(cmd["args"])
         if args is None:
             return
-        self._start("uv", args, cmd["label"], row, cmd.get("env"))
+        env = self._interpreter_env()
+        env.update(cmd.get("env") or {})
+        self._start("uv", args, cmd["label"], row, env)
 
     def run_manual(self):
-        text = self.manual_input.text().strip()
+        text = self.manual_input.currentText().strip()
         if not text:
             self.output.appendPlainText("请输入要运行的命令。")
             return
@@ -835,14 +1174,40 @@ class LauncherWindow(QMainWindow):
         except ValueError as exc:
             self.output.appendPlainText(f"命令解析失败: {exc}")
             return
-        program = self.interpreter or "uv"
-        if not self.interpreter:
+        script = args[0] if args else ""
+        is_script = script.lower().endswith(".py")
+        if self.interpreter:
+            program = self.interpreter
+        elif is_script:
+            program = "uv"
+            args = ["run", "python"] + args
+        else:
+            program = "uv"
             if args and args[0].lower() == "uv":
                 args = args[1:]
             if not args:
                 self.output.appendPlainText("请输入 uv 之后的参数，例如: sync")
                 return
+        self._record_history(text)
         self._start(program, args, "手动输入", None)
+
+    def _record_history(self, text):
+        text = text.strip()
+        if not text:
+            return
+        if text in self.history:
+            self.history.remove(text)
+        self.history.insert(0, text)
+        del self.history[MAX_HISTORY:]
+        self.history_model.clear()
+        for h in self.history:
+            self.history_model.appendRow(QStandardItem(h))
+        self.manual_input.blockSignals(True)
+        self.manual_input.clear()
+        self.manual_input.addItems(self.history)
+        self.manual_input.setEditText(text)
+        self.manual_input.blockSignals(False)
+        save_json(HISTORY_FILE, self.history)
 
     def _start(self, program, args, label, row, env=None):
         shown = f"$ {program} {' '.join(args)}   ({label})"
